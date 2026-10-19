@@ -16,8 +16,8 @@ variable "ssh_ingress_cidr" {
   default     = "0.0.0.0/0"
 }
 
-variable "ssh_config_fragment_path" {
-  description = "Path where Terraform writes SSH host aliases after creating the instances."
+variable "ssh_config_path" {
+  description = "Path to the OpenSSH client config Terraform updates with the EC2 aliases."
   type        = string
-  default     = "~/.ssh/terraform-ubuntu-ec2.conf"
+  default     = "~/.ssh/config"
 }
