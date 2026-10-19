@@ -1,6 +1,10 @@
 locals {
-  instance_names = ["ubuntu1", "ubuntu2"]
-  public_key     = file(pathexpand(var.ssh_public_key_path))
+  instance_names = ["ec2-1", "ec2-2"]
+  vm_targets = {
+    ubuntu1 = "192.168.8.102"
+    ubuntu2 = "192.168.8.103"
+  }
+  public_key = file(pathexpand(var.ssh_public_key_path))
 }
 
 data "aws_vpc" "default" {
@@ -14,24 +18,8 @@ data "aws_subnets" "default_vpc" {
   }
 }
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-noble-24.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "architecture"
-    values = ["x86_64"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
+data "aws_ssm_parameter" "ubuntu_ami" {
+  name = "/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id"
 }
 
 resource "aws_key_pair" "ubuntu" {
@@ -52,6 +40,14 @@ resource "aws_security_group" "ssh" {
     cidr_blocks = [var.ssh_ingress_cidr]
   }
 
+  ingress {
+    description = "Node Exporter metrics"
+    from_port   = 9100
+    to_port     = 9100
+    protocol    = "tcp"
+    cidr_blocks = [var.ssh_ingress_cidr]
+  }
+
   egress {
     description = "All outbound traffic"
     from_port   = 0
@@ -68,28 +64,94 @@ resource "aws_security_group" "ssh" {
 resource "aws_instance" "ubuntu" {
   count = length(local.instance_names)
 
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = "t2.micro"
+  ami                         = data.aws_ssm_parameter.ubuntu_ami.value
+  instance_type               = "t3.micro"
   key_name                    = aws_key_pair.ubuntu.key_name
   subnet_id                   = data.aws_subnets.default_vpc.ids[count.index % length(data.aws_subnets.default_vpc.ids)]
   vpc_security_group_ids      = [aws_security_group.ssh.id]
   associate_public_ip_address = true
+
+  user_data = <<-USER_DATA
+    #!/bin/bash
+    set -euxo pipefail
+    apt-get update
+    apt-get install -y docker.io
+    systemctl enable --now docker
+    docker run -d \
+      --name node-exporter \
+      --restart unless-stopped \
+      --network host \
+      --pid host \
+      -v "/:/host:ro,rslave" \
+      prom/node-exporter:latest \
+      --path.rootfs=/host
+  USER_DATA
 
   tags = {
     Name = local.instance_names[count.index]
   }
 }
 
+resource "local_file" "prometheus_config" {
+  filename        = "${path.module}/monitoring/prometheus.yml"
+  file_permission = "0644"
+  content = yamlencode({
+    global = {
+      scrape_interval = "15s"
+    }
+    scrape_configs = [{
+      job_name = "servers"
+      static_configs = concat(
+        [
+          for name, ip in local.vm_targets : {
+            targets = ["${ip}:9100"]
+            labels  = { server = "vm-${name}" }
+          }
+        ],
+        [
+          for i, name in local.instance_names : {
+            targets = ["${aws_instance.ubuntu[i].public_ip}:9100"]
+            labels  = { server = name }
+          }
+        ]
+      )
+    }]
+  })
+}
+
+data "local_file" "existing_ssh_config" {
+  filename = pathexpand(var.ssh_config_path)
+}
+
+locals {
+  ssh_config_without_old_include = replace(
+    data.local_file.existing_ssh_config.content,
+    "/(?im)^Include[ \\t]+.*terraform-ubuntu-ec2\\.conf[ \\t]*\\r?\\n?/",
+    ""
+  )
+  ssh_config_without_managed_block = replace(
+    local.ssh_config_without_old_include,
+    "/(?ms)^# BEGIN TERRAFORM MANAGED EC2 HOSTS\\r?\\n.*?^# END TERRAFORM MANAGED EC2 HOSTS\\r?\\n?/",
+    ""
+  )
+}
+
 resource "local_file" "ssh_config" {
-  filename        = pathexpand(var.ssh_config_fragment_path)
+  filename        = pathexpand(var.ssh_config_path)
   file_permission = "0600"
-  content = join("\n", [
-    for i, name in local.instance_names : <<-EOT
+  content = <<-EOT
+    ${trimspace(local.ssh_config_without_managed_block)}
+
+    # BEGIN TERRAFORM MANAGED EC2 HOSTS
+    ${join("\n", [
+  for i, name in local.instance_names : <<-HOST
       Host ${name}
           HostName ${aws_instance.ubuntu[i].public_ip}
           User ubuntu
           IdentityFile ~/.ssh/id_ed25519
           IdentitiesOnly yes
-    EOT
-  ])
+      HOST
+])}
+    # END TERRAFORM MANAGED EC2 HOSTS
+  EOT
 }
