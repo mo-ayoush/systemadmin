@@ -77,8 +77,8 @@ if [ -z "$logdata" ]; then
   echo 'SSH_LOGS: unavailable (no readable journal or auth log)'
 else
   # Match sshd authentication outcomes; counts are log entries, not necessarily unique sessions.
-  failed=$(printf '%s\n' "$logdata" | grep -Eic 'sshd.*(Failed password| authentication failure|Invalid user| maximum authentication attempts)' || true)
-  succeeded=$(printf '%s\n' "$logdata" | grep -Eic 'sshd.*Accepted (password|publickey|keyboard-interactive)' || true)
+  failed=$(printf '%s\n' "$logdata" | grep -Eic '(Failed password|authentication failure|Invalid user|maximum authentication attempts)' || true)
+  succeeded=$(printf '%s\n' "$logdata" | grep -Eic 'Accepted (password|publickey|keyboard-interactive)' || true)
   printf 'SSH_LOGS: readable\nSSH_FAILED: %s\nSSH_SUCCEEDED: %s\n' "$failed" "$succeeded"
 fi
 REMOTE_COLLECTOR
